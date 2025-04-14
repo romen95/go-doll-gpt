@@ -1,144 +1,228 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
+	"strings"
 	"sync"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/joho/godotenv"
+	openai "github.com/sashabaranov/go-openai"
+)
+
+var (
+	bot          *tgbotapi.BotAPI
+	openaiClient *openai.Client
+	sessions     = make(map[int64]*Session)
+	mu           sync.Mutex
 )
 
 type Session struct {
-	Step    string
-	Photos  []string // file_id
-	Name    string
-	Clothes string
-	Objects string
+	Step        string
+	Photos      []string
+	Name        string
+	Accessories string
 }
 
-var (
-	userSessions = make(map[int64]*Session)
-	sessionMutex sync.Mutex
-)
-
 func main() {
-	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
-	if botToken == "" {
-		log.Fatal("TELEGRAM_BOT_TOKEN is not set")
+	if err := godotenv.Load(); err != nil {
+		log.Fatal("Ошибка загрузки файла .env")
+	}
+
+	botToken := os.Getenv("TELEGRAM_API_KEY")
+	openaiToken := os.Getenv("OPENAI_API_KEY")
+
+	if botToken == "" || openaiToken == "" {
+		log.Fatal("Требуется TELEGRAM_API_KEY и OPENAI_API_KEY")
 	}
 
 	bot, err := tgbotapi.NewBotAPI(botToken)
 	if err != nil {
 		log.Panic(err)
 	}
+	openaiClient = openai.NewClient(openaiToken)
 
-	bot.Debug = true
+	bot.Debug = false
+
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
+
 	updates := bot.GetUpdatesChan(u)
 
 	for update := range updates {
 		if update.Message != nil {
-			handleMessage(bot, update.Message)
+			handleMessage(update.Message)
 		}
 		if update.CallbackQuery != nil {
-			handleCallback(bot, update.CallbackQuery)
+			handleCallback(update.CallbackQuery)
 		}
 	}
 }
 
-func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
+func handleMessage(msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
 
-	session := getSession(chatID)
+	mu.Lock()
+	session, exists := sessions[chatID]
+	if !exists {
+		session = &Session{}
+		sessions[chatID] = session
+	}
+	mu.Unlock()
 
-	switch session.Step {
-	case "await_photos":
-		if msg.Photo != nil {
-			lastPhoto := msg.Photo[len(msg.Photo)-1]
-			session.Photos = append(session.Photos, lastPhoto.FileID)
-
-			if len(session.Photos) >= 3 {
+	if msg.Text != "" {
+		switch session.Step {
+		case "await_name":
+			handleName(msg, session)
+		case "await_accessories":
+			handleAccessories(msg, session)
+		default:
+			if strings.ToLower(msg.Text) == "/start" {
+				button := tgbotapi.NewInlineKeyboardButtonData("🎁 Сделать фигурку в упаковке", "make_figure")
+				keyboard := tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(button))
+				msgCfg := tgbotapi.NewMessage(chatID, "Привет! Хочешь стать игрушкой?")
+				msgCfg.ReplyMarkup = keyboard
+				bot.Send(msgCfg)
+			} else if strings.ToLower(msg.Text) == "готово" && len(session.Photos) > 0 {
 				session.Step = "await_name"
 				bot.Send(tgbotapi.NewMessage(chatID, "Теперь введи имя для фигурки 👤"))
-			} else {
-				bot.Send(tgbotapi.NewMessage(chatID, "Фото получено. Можешь отправить ещё, или напиши \"Готово\""))
 			}
-		} else if msg.Text == "Готово" && len(session.Photos) > 0 {
-			session.Step = "await_name"
-			bot.Send(tgbotapi.NewMessage(chatID, "Отлично! Теперь введи имя для фигурки 👤"))
-		} else {
-			bot.Send(tgbotapi.NewMessage(chatID, "Пожалуйста, отправь фото или напиши \"Готово\""))
 		}
-	case "await_name":
-		session.Name = msg.Text
-		session.Step = "await_clothes"
-		bot.Send(tgbotapi.NewMessage(chatID, "Какая одежда на фигурке? 🧥"))
-	case "await_clothes":
-		session.Clothes = msg.Text
-		session.Step = "await_objects"
-		bot.Send(tgbotapi.NewMessage(chatID, "Какие объекты будут рядом с игрушкой? 🎁"))
-	case "await_objects":
-		session.Objects = msg.Text
-		session.Step = "ready"
+	}
 
-		// Здесь будет отправка в OpenAI
-		bot.Send(tgbotapi.NewMessage(chatID, "Отлично! Начинаю создавать фигурку... 🛠️"))
-
-		// Вызываем заглушку для генерации
-		go generateToyFigure(bot, chatID, session)
-	default:
-		bot.Send(tgbotapi.NewMessage(chatID, "Нажми кнопку /start, чтобы начать 👋"))
+	if msg.Photo != nil && len(msg.Photo) > 0 {
+		handlePhoto(msg, session)
 	}
 }
 
-func handleCallback(bot *tgbotapi.BotAPI, cb *tgbotapi.CallbackQuery) {
+func handleCallback(cb *tgbotapi.CallbackQuery) {
 	chatID := cb.Message.Chat.ID
-	if cb.Data == "make_figure" {
-		resetSession(chatID)
-		session := getSession(chatID)
-		session.Step = "await_photos"
 
-		bot.Send(tgbotapi.NewMessage(chatID, "Отправь мне одно, два или три фото своего лица 📸"))
+	mu.Lock()
+	sessions[chatID] = &Session{Step: "await_photos"}
+	mu.Unlock()
+
+	msg := tgbotapi.NewMessage(chatID, "Отправь мне одно, два или три фото своего лица 📸")
+	bot.Send(msg)
+}
+
+func handlePhoto(msg *tgbotapi.Message, session *Session) {
+	if msg.Photo != nil && len(msg.Photo) > 0 {
+		photos := msg.Photo
+		lastPhoto := photos[len(photos)-1]
+		fileID := lastPhoto.FileID
+
+		fileURL, err := bot.GetFileDirectURL(fileID)
+		if err != nil {
+			log.Println("Ошибка при получении URL файла:", err)
+			bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Не удалось получить фото. Попробуй снова!"))
+			return
+		}
+
+		session.Photos = append(session.Photos, fileURL)
+		log.Println("Фото добавлено:", fileURL)
+
+		if len(session.Photos) >= 3 {
+			session.Step = "await_name"
+			bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Теперь введи имя для фигурки 👤"))
+		} else {
+			bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Фото получено. Можешь отправить ещё, или напиши \"Готово\""))
+		}
 	}
 }
 
-func getSession(chatID int64) *Session {
-	sessionMutex.Lock()
-	defer sessionMutex.Unlock()
+func handleName(msg *tgbotapi.Message, session *Session) {
+	session.Name = msg.Text
+	session.Step = "await_accessories"
+	bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Теперь опиши одежду и аксессуары для фигурки (например: «в чёрной куртке, с рюкзаком и кроссовками») 🎽🎧🎒"))
+}
 
-	if session, exists := userSessions[chatID]; exists {
-		return session
+func handleAccessories(msg *tgbotapi.Message, session *Session) {
+	session.Accessories = msg.Text
+
+	description, err := analyzeImage(session.Photos)
+	if err != nil {
+		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Ошибка при анализе изображения: "+err.Error()))
+		return
 	}
 
-	userSessions[chatID] = &Session{}
-	return userSessions[chatID]
+	prompt := generatePrompt(session.Name, session.Accessories, description)
+
+	imageURL, err := generateImage(prompt)
+	if err != nil {
+		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Ошибка при генерации изображения: "+err.Error()))
+		return
+	}
+
+	photo := tgbotapi.NewPhoto(msg.Chat.ID, tgbotapi.FileURL(imageURL))
+	photo.Caption = "Вот твоя фигурка! 🔥"
+	bot.Send(photo)
+
+	delete(sessions, msg.Chat.ID)
 }
 
-func resetSession(chatID int64) {
-	sessionMutex.Lock()
-	defer sessionMutex.Unlock()
-	userSessions[chatID] = &Session{}
+func analyzeImage(photoURLs []string) (string, error) {
+	ctx := context.Background()
+	var media []openai.ChatMessagePart
+
+	for _, url := range photoURLs {
+		media = append(media, openai.ChatMessagePart{
+			Type: openai.ChatMessagePartTypeImageURL,
+			ImageURL: &openai.ChatMessageImageURL{
+				URL:    url,
+				Detail: openai.ImageURLDetailHigh,
+			},
+		})
+	}
+
+	req := openai.ChatCompletionRequest{
+		Model: openai.GPT4VisionPreview,
+		Messages: []openai.ChatCompletionMessage{
+			{
+				Role: "user",
+				MultiContent: append(media, openai.ChatMessagePart{
+					Type: openai.ChatMessagePartTypeText,
+					Text: "Опиши внешность человека на фото в контексте создания фигурки.",
+				}),
+			},
+		},
+		MaxTokens: 300,
+	}
+
+	resp, err := openaiClient.CreateChatCompletion(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	return resp.Choices[0].Message.Content, nil
 }
 
-func generateToyFigure(bot *tgbotapi.BotAPI, chatID int64, s *Session) {
-	// Здесь будет логика отправки в OpenAI и генерации картинки
-	// Сейчас просто заглушка:
+func generatePrompt(name, accessories, visionDescription string) string {
+	return `Создай изображение в стиле пластиковой игровой фигурки в упаковке.
 
-	prompt := generatePrompt(s)
-	log.Println("PROMPT:\n", prompt)
-
-	// Тут можно добавить вызов OpenAI API
-	bot.Send(tgbotapi.NewMessage(chatID, "Фигурка почти готова! (Здесь будет результат генерации) 🧸"))
+Имя: ` + name + `
+Внешность (по фото): ` + visionDescription + `
+Одежда и аксессуары (от пользователя): ` + accessories + `
+Фон: картонный, минималистичный.
+Все объекты должны выглядеть пластиковыми, как настоящая игрушка в упаковке.`
 }
 
-func generatePrompt(s *Session) string {
-	return "Дорогой искусственный интеллект, создай пожалуйста изображение в стиле игровой фигурки упакованной в пластик, на основе изображения, которое я прикрепил к сообщению.\n\n" +
-		"Изображение должно содержать:\n" +
-		"- Имя: " + s.Name + "\n" +
-		"- Одежда: " + s.Clothes + "\n" +
-		"- Объекты рядом с фигуркой:\n'Accessories'\nОбъекты: " + s.Objects + "\n" +
-		"- Стиль фона: Картонный минимализм, как в описании\n" +
-		"Оставь все объекты пластиковыми.\n\n" +
-		"Сделайте изображение как можно более реалистичным - как будто это настоящая игрушка, которую можно найти в магазине."
+func generateImage(prompt string) (string, error) {
+	ctx := context.Background()
+
+	req := openai.ImageRequest{
+		Model:          openai.CreateImageModelDallE3,
+		Prompt:         prompt,
+		Size:           openai.CreateImageSize1024x1024,
+		ResponseFormat: openai.CreateImageResponseFormatURL,
+		N:              1,
+	}
+
+	resp, err := openaiClient.CreateImage(ctx, req)
+	if err != nil {
+		return "", err
+	}
+
+	return resp.Data[0].URL, nil
 }
